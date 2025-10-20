@@ -1,0 +1,22 @@
+[project]
+name = "adam-chatbot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.2.0",
+    "faiss-cpu>=1.12.0",
+    "langchain>=1.0.0",
+    "langchain-community>=0.4",
+    "langchain-core>=1.0.0",
+    "langchain-groq>=1.0.0",
+    "langchain-openai>=1.0.0",
+    "langgraph>=1.0.0",
+    "marimo>=0.17.0",
+    "pymupdf>=1.26.5",
+    "pypdf>=6.1.1",
+    "python-dotenv>=1.1.1",
+    "sentence-transformers>=5.1.1",
+    "typesense>=1.1.1",
+]
