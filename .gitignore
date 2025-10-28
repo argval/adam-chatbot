@@ -8,3 +8,20 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment files
+.env
+.env.example
+.env.*
+
+# Data directories and artifacts (exclude all project data from VCS)
+data/**
+**/data/**
+**/processed/**
+**/raw/**
+**/vector_store/**
+**/indexed/**
+**/indexes/**
+
+# Optional: keep a placeholder if needed
+!data/.gitkeep

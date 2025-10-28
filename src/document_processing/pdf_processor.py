@@ -1,9 +1,19 @@
 import logging
-from typing import List, Dict
+from functools import lru_cache
+from typing import Dict, List
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .document_processor import DocumentProcessor
+
+DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
+
+
+@lru_cache(maxsize=1)
+def _load_semantic_model(model_name: str = DEFAULT_MODEL_NAME):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
 
 
 class PDFProcessor(DocumentProcessor):
@@ -19,7 +29,6 @@ class PDFProcessor(DocumentProcessor):
                 return {"chunks": [], "classes": []}
 
             # Hybrid for PDFs: Semantic for long docs using sentence-transformers, character for short
-            from sentence_transformers import SentenceTransformer
             from sklearn.metrics.pairwise import cosine_similarity
 
             character_splitter = RecursiveCharacterTextSplitter(
@@ -30,8 +39,8 @@ class PDFProcessor(DocumentProcessor):
             full_text = "\n".join([page.page_content for page in pages])
             if len(full_text) > 5000:
                 # Semantic splitting using sentence-transformers
-                model = SentenceTransformer('all-MiniLM-L6-v2')
-                sentences = full_text.split('. ')
+                model = _load_semantic_model()
+                sentences = [sentence.strip() for sentence in full_text.split(". ") if sentence.strip()]
                 if not sentences:
                     chunks = character_splitter.split_documents(pages)
                 else:
@@ -40,8 +49,8 @@ class PDFProcessor(DocumentProcessor):
                     chunks = []
                     current_chunk = sentences[0]
                     for i in range(1, len(sentences)):
-                        if similarities[i-1, i] > 0.7:
-                            current_chunk += '. ' + sentences[i]
+                        if similarities[i - 1, i] > 0.7:
+                            current_chunk += ". " + sentences[i]
                         else:
                             chunks.append(Document(page_content=current_chunk, metadata={"source": file_path}))
                             current_chunk = sentences[i]

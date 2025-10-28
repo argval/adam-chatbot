@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict
+from typing import Dict, List
 from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
@@ -37,6 +37,10 @@ class TextProcessor(DocumentProcessor):
                 chunks = markdown_splitter.split_text(docs[0].page_content) if docs else []
             else:
                 chunks = character_splitter.split_documents(docs)
+
+            for chunk in chunks:
+                # Ensure downstream consumers always receive a source pointer.
+                chunk.metadata["source"] = file_path
 
             return {"chunks": chunks, "classes": []}
         except Exception as e:
