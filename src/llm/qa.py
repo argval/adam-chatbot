@@ -1,9 +1,10 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 from groq import BadRequestError
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.vector_store.query import query_vector_store
 
@@ -18,14 +19,20 @@ QA_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             (
-                "You are a helpful research assistant. "
-                "Use the provided context snippets to answer the user's question. "
-                "If the answer cannot be determined from the context, explicitly state that."
+                "You are a friendly, knowledgeable assistant grounded in the provided context. "
+                "Answer conversationally, cite evidence as [Source #] that matches the context labels, "
+                "and if the context lacks enough information, admit it and suggest a follow-up question."
             ),
         ),
+        MessagesPlaceholder(variable_name="chat_history"),
         (
             "human",
-            "Question:\n{question}\n\nContext:\n{context}\n\nAnswer:",
+            (
+                "Use the following context snippets to answer the latest question.\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {question}\n\n"
+                "Provide a concise, helpful answer that references the relevant sources."
+            ),
         ),
     ]
 )
@@ -36,7 +43,7 @@ def _format_context(results: List[Dict], max_chars: int = MAX_CHARS_PER_CHUNK) -
     for idx, item in enumerate(results, start=1):
         metadata = item.get("metadata", {}) or {}
         source = metadata.get("source", "unknown source")
-        content = item.get("content", "").strip()
+        content = (item.get("content") or "").strip()
 
         if not content:
             continue
@@ -59,20 +66,44 @@ def _summarize_sources(results: List[Dict]) -> List[Dict[str, object]]:
     ]
 
 
+def _history_to_messages(
+    chat_history: Sequence[Tuple[str, str]] | None,
+) -> List[BaseMessage]:
+    if not chat_history:
+        return []
+
+    messages: List[BaseMessage] = []
+    for role, content in chat_history:
+        if not content:
+            continue
+
+        role_normalized = role.lower()
+        if role_normalized in {"user", "human"}:
+            messages.append(HumanMessage(content=content))
+        elif role_normalized in {"assistant", "ai", "bot"}:
+            messages.append(AIMessage(content=content))
+        else:
+            raise ValueError(f"Unsupported chat history role: {role}")
+
+    return messages
+
+
 def answer_question(
     question: str,
     vector_store_path: str = "data/vector_store",
     n_results: int = 5,
     model_name: str = DEFAULT_GROQ_MODEL,
+    chat_history: Sequence[Tuple[str, str]] | None = None,
 ) -> Dict[str, object]:
     """
-    Generate an answer using Groq's Llama3 model with retrieved vector-store context.
+    Generate an answer using Groq's LLM with retrieved vector-store context.
 
     Args:
         question: User's question.
         vector_store_path: Path to the Chroma DB directory.
         n_results: Number of context chunks to retrieve.
         model_name: Groq model identifier to use.
+        chat_history: Sequence of (role, message) tuples from the ongoing conversation.
 
     Returns:
         Dict containing the `answer` text and the `sources` metadata list.
@@ -89,15 +120,21 @@ def answer_question(
     if not results:
         logger.info("No retrieval results for question: %s", question)
         return {
-            "answer": "I could not find enough information in the knowledge base to answer that.",
+            "answer": "I couldn't find enough information in the knowledge base to answer that yet.",
             "sources": [],
         }
 
     context = _format_context(results)
-    llm = get_groq_llm(model_name=model_name)
+    llm = get_groq_llm(model_name=model_name or DEFAULT_GROQ_MODEL)
     chain = QA_PROMPT | llm | StrOutputParser()
     try:
-        answer = chain.invoke({"question": question, "context": context}).strip()
+        answer = chain.invoke(
+            {
+                "question": question,
+                "context": context,
+                "chat_history": _history_to_messages(chat_history),
+            }
+        ).strip()
     except BadRequestError as exc:
         raise RuntimeError(
             "Groq rejected the request. Verify GROQ_MODEL_NAME points to a supported model."

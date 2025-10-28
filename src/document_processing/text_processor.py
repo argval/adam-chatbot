@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Dict, List
 from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -34,13 +35,16 @@ class TextProcessor(DocumentProcessor):
             # Check file extension for hybrid logic
             ext = file_path.split(".")[-1].lower()
             if ext in ["md", "html"]:
-                chunks = markdown_splitter.split_text(docs[0].page_content) if docs else []
+                chunks = (
+                    markdown_splitter.split_text(docs[0].page_content) if docs else []
+                )
             else:
                 chunks = character_splitter.split_documents(docs)
 
             for chunk in chunks:
                 # Ensure downstream consumers always receive a source pointer.
                 chunk.metadata["source"] = file_path
+                chunk.metadata["source_name"] = Path(file_path).name
 
             return {"chunks": chunks, "classes": []}
         except Exception as e:

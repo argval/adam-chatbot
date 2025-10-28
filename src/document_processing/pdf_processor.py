@@ -1,5 +1,6 @@
 import logging
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
@@ -60,6 +61,7 @@ class PDFProcessor(DocumentProcessor):
 
             for chunk in chunks:
                 chunk.metadata["source"] = file_path
+                chunk.metadata["source_name"] = Path(file_path).name
 
             return {"chunks": chunks, "classes": []}
         except Exception as e:
