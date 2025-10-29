@@ -1,9 +1,14 @@
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+
 from langchain_community.document_loaders import UnstructuredFileLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from langchain_core.documents import Document
+
 from .document_processor import DocumentProcessor
 
 
@@ -12,8 +17,7 @@ class TextProcessor(DocumentProcessor):
         self, file_path: str, chunk_size: int, chunk_overlap: int
     ) -> Dict[str, List[Document]]:
         try:
-            loader = UnstructuredFileLoader(file_path, mode="single")
-            docs = loader.load()
+            docs = self._load_documents(file_path)
 
             if not docs:
                 logging.warning(
@@ -50,3 +54,35 @@ class TextProcessor(DocumentProcessor):
         except Exception as e:
             logging.error(f"Failed to process text file {file_path}. Error: {e}")
             return {"chunks": [], "classes": []}
+
+    def _load_documents(self, file_path: str) -> List[Document]:
+        """
+        Attempt to load documents using UnstructuredFileLoader. If unavailable or failing,
+        fall back to a plain text read.
+        """
+        try:
+            loader = UnstructuredFileLoader(file_path, mode="single")
+            return loader.load()
+        except Exception as exc:
+            logging.warning(
+                "Falling back to plain-text loader for %s due to %s", file_path, exc
+            )
+            content = self._read_text_file(file_path)
+            if content is None:
+                return []
+            return [Document(page_content=content, metadata={"source": file_path})]
+
+    @staticmethod
+    def _read_text_file(file_path: str) -> Optional[str]:
+        path = Path(file_path)
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                return path.read_text(encoding="latin-1")
+            except Exception as exc:
+                logging.error("Unable to read %s due to %s", file_path, exc)
+                return None
+        except Exception as exc:
+            logging.error("Unable to read %s due to %s", file_path, exc)
+            return None

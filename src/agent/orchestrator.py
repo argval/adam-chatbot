@@ -1,8 +1,6 @@
-import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
-import re
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,10 +12,30 @@ from src.embeddings.embed import embed_and_store
 from src.ingestion.ingest import ingest_data
 from src.llm.qa import answer_question
 from src.vector_store.query import query_vector_store
+from .utils import (
+    TelemetryConfig,
+    TelemetryManager,
+    VerificationConfig,
+    VerificationHelper,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class AgentConfig:
+    top_k: int = int(os.getenv("AGENT_TOP_K", "5"))
+    rerank_enabled: bool = _env_flag("AGENT_RERANK_ENABLED", True)
+    cross_encoder_model: Optional[str] = os.getenv("AGENT_RERANK_MODEL")
 
 
 class AgentState(TypedDict, total=False):
@@ -32,48 +50,28 @@ class AgentState(TypedDict, total=False):
 
 @dataclass
 class AgentOrchestrator:
-    raw_dir: str = "data/raw"
-    processed_dir: str = "data/processed"
-    vector_store_path: str = "data/vector_store"
-    k: int = 5
-    cross_encoder_model: Optional[str] = None
+    raw_dir: str = field(default_factory=lambda: os.getenv("AGENT_RAW_DIR", "data/raw"))
+    processed_dir: str = field(
+        default_factory=lambda: os.getenv("AGENT_PROCESSED_DIR", "data/processed")
+    )
+    vector_store_path: str = field(
+        default_factory=lambda: os.getenv("AGENT_VECTOR_STORE_PATH", "data/vector_store")
+    )
+    config: AgentConfig = field(default_factory=AgentConfig)
+    telemetry_config: TelemetryConfig = field(default_factory=TelemetryConfig)
+    verification_config: VerificationConfig = field(default_factory=VerificationConfig)
     history: List[tuple[str, str]] = field(default_factory=list)
 
-    _STOPWORDS = {
-        "what",
-        "where",
-        "when",
-        "which",
-        "who",
-        "whose",
-        "whom",
-        "why",
-        "how",
-        "does",
-        "the",
-        "that",
-        "this",
-        "with",
-        "from",
-        "into",
-        "about",
-        "for",
-        "your",
-        "have",
-        "has",
-        "know",
-        "look",
-        "like",
-        "show",
-        "tell",
-        "give",
-        "experience",
-    }
-
     def __post_init__(self) -> None:
-        self.cross_encoder = self._load_cross_encoder(self.cross_encoder_model)
-        self.status_file = Path("data/status.json")
-        self.logs_file = Path("data/logs/conversations.jsonl")
+        self.top_k = self.config.top_k
+        self.rerank_enabled = self.config.rerank_enabled
+        self.cross_encoder = (
+            self._load_cross_encoder(self.config.cross_encoder_model)
+            if self.rerank_enabled and self.config.cross_encoder_model
+            else None
+        )
+        self.telemetry = TelemetryManager(self.telemetry_config)
+        self.verifier = VerificationHelper(self.verification_config)
         self.graph = self._build_graph()
 
     # Public API -----------------------------------------------------------------
@@ -155,8 +153,14 @@ class AgentOrchestrator:
         )
         state.setdefault("actions", []).extend(["ingest", "embed"])
         state["message"] = "📥 Ingestion and embedding completed. Knowledge base refreshed."
-        doc_count = self._count_processed_documents()
-        self._update_status(event="ingest", document_count=doc_count)
+        doc_count = TelemetryManager.count_processed_documents(self.processed_dir)
+        self.telemetry.update_status(
+            event="ingest",
+            raw_dir=self.raw_dir,
+            processed_dir=self.processed_dir,
+            vector_store_path=self.vector_store_path,
+            document_count=doc_count,
+        )
         return state
 
     def _embed_node(self, state: AgentState) -> AgentState:
@@ -166,8 +170,14 @@ class AgentOrchestrator:
         )
         state.setdefault("actions", []).append("embed")
         state["message"] = "🧠 Embeddings updated from existing processed documents."
-        doc_count = self._count_processed_documents()
-        self._update_status(event="embed", document_count=doc_count)
+        doc_count = TelemetryManager.count_processed_documents(self.processed_dir)
+        self.telemetry.update_status(
+            event="embed",
+            raw_dir=self.raw_dir,
+            processed_dir=self.processed_dir,
+            vector_store_path=self.vector_store_path,
+            document_count=doc_count,
+        )
         return state
 
     def _retrieve_node(self, state: AgentState) -> AgentState:
@@ -175,13 +185,13 @@ class AgentOrchestrator:
         results = query_vector_store(
             query=question,
             vector_store_path=self.vector_store_path,
-            n_results=self.k,
+            n_results=self.top_k,
         )
         results = self._rerank(question, results)
         state["context"] = results
         state.setdefault("actions", []).append("retrieve")
         state["message"] = self._format_context_preview(results)
-        state["verification"] = self._basic_verification(question, results)
+        state["verification"] = self.verifier.basic(question, results)
         return state
 
     def _answer_node(self, state: AgentState) -> AgentState:
@@ -189,13 +199,13 @@ class AgentOrchestrator:
         results = query_vector_store(
             query=question,
             vector_store_path=self.vector_store_path,
-            n_results=self.k,
+            n_results=self.top_k,
         )
         results = self._rerank(question, results)
         payload = answer_question(
             question=question,
             vector_store_path=self.vector_store_path,
-            n_results=self.k,
+            n_results=self.top_k,
             chat_history=self.history,
         )
         state["context"] = results
@@ -206,7 +216,7 @@ class AgentOrchestrator:
         return state
 
     def _status_node(self, state: AgentState) -> AgentState:
-        status = self._read_status()
+        status = self.telemetry.read_status()
         state.setdefault("actions", []).append("status")
         if not status:
             state["message"] = (
@@ -224,89 +234,17 @@ class AgentOrchestrator:
         state["message"] = "\n".join(lines)
         return state
 
-    def _count_processed_documents(self) -> Optional[int]:
-        processed_file = Path(self.processed_dir) / "documents.json"
-        if not processed_file.exists():
-            return None
-        try:
-            with processed_file.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return len(data)
-        except Exception as exc:
-            logger.warning("Failed to count processed documents: %s", exc)
-            return None
-
-    def _update_status(self, event: str, document_count: Optional[int] = None) -> None:
-        status = {}
-        if self.status_file.exists():
-            try:
-                with self.status_file.open("r", encoding="utf-8") as fh:
-                    status = json.load(fh)
-            except Exception:
-                status = {}
-
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        if event == "ingest":
-            status["last_ingest_at"] = timestamp
-        if event in {"ingest", "embed"}:
-            status["last_embed_at"] = timestamp
-        if document_count is not None:
-            status["documents_indexed"] = document_count
-
-        status["raw_dir"] = self.raw_dir
-        status["processed_dir"] = self.processed_dir
-        status["vector_store_path"] = self.vector_store_path
-
-        self.status_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.status_file.open("w", encoding="utf-8") as fh:
-            json.dump(status, fh, indent=2)
-
-    def _read_status(self) -> Optional[Dict[str, object]]:
-        if not self.status_file.exists():
-            return None
-        try:
-            with self.status_file.open("r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception as exc:
-            logger.warning("Failed to read status file: %s", exc)
-            return None
-
-    def _log_interaction(self, state: AgentState) -> None:
-        record = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "question": state.get("question"),
-            "answer": state.get("answer") or state.get("message"),
-            "actions": state.get("actions"),
-            "verification": state.get("verification"),
-            "sources": [
-                {
-                    "source": (item.get("metadata") or {}).get("source"),
-                    "source_name": (item.get("metadata") or {}).get("source_name"),
-                    "score": item.get("score"),
-                }
-                for item in state.get("context", []) or []
-            ],
-        }
-
-        self.logs_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with self.logs_file.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record))
-                fh.write("\n")
-        except Exception as exc:
-            logger.warning("Failed to append conversation log: %s", exc)
-
     def _verify_node(self, state: AgentState) -> AgentState:
         question = state.get("question", "")
         context = state.get("context", [])
         answer = state.get("answer")
 
-        baseline = self._basic_verification(question, context)
+        baseline = self.verifier.basic(question, context)
         if not answer:
             state["verification"] = baseline
             return state
 
-        self_check = self._self_review(answer, context)
+        self_check = self.verifier.self_check(answer, context)
         if baseline and self_check:
             state["verification"] = f"{baseline}\n{self_check}"
         else:
@@ -316,7 +254,23 @@ class AgentOrchestrator:
     def _finalize_node(self, state: AgentState) -> AgentState:
         if "message" not in state and "answer" in state:
             state["message"] = state["answer"]
-        self._log_interaction(state)
+        sources = [
+            {
+                "source": (item.get("metadata") or {}).get("source"),
+                "source_name": (item.get("metadata") or {}).get("source_name"),
+                "score": item.get("score"),
+            }
+            for item in state.get("context", []) or []
+        ]
+        self.telemetry.log_interaction(
+            {
+                "question": state.get("question"),
+                "answer": state.get("answer") or state.get("message"),
+                "actions": state.get("actions"),
+                "verification": state.get("verification"),
+                "sources": sources,
+            }
+        )
         return state
 
     # Utility methods ------------------------------------------------------------
@@ -336,69 +290,6 @@ class AgentOrchestrator:
             lines.append(f"{idx}. {source} (score: {score_text}) – {snippet}")
         return "\n".join(lines)
 
-    def _basic_verification(
-        self,
-        question: str,
-        sources: List[Dict[str, object]],
-    ) -> str:
-        if not sources:
-            return "⚠️ Verification: No supporting context retrieved."
-
-        tokens = {
-            token.lower()
-            for token in question.split()
-            if len(token) >= 4 and token.isalpha()
-        }
-        covered = set()
-        for item in sources:
-            content = (item.get("content") or "").lower()
-            for token in tokens:
-                if token in content:
-                    covered.add(token)
-        missing = sorted(tokens - covered)
-        if missing:
-            return (
-                "⚠️ Verification: Some query terms were not found in the retrieved context "
-                f"({', '.join(missing)})."
-            )
-        return "✅ Verification: Retrieved context covers the main query terms."
-
-    def _self_review(self, answer: str, sources: List[Dict[str, object]]) -> str:
-        context_blob = " ".join(
-            (item.get("content") or "").lower() for item in sources if item
-        ).strip()
-        if not context_blob:
-            return "⚠️ Self-check: No context available to verify the answer."
-
-        sentences = [
-            sentence.strip()
-            for sentence in re.split(r"(?<=[.!?])\s+", answer)
-            if sentence.strip()
-        ]
-        issues: List[str] = []
-
-        for sentence in sentences:
-            if len(sentence) < 24:
-                continue
-            tokens = [
-                token.lower()
-                for token in re.findall(r"[A-Za-z]{4,}", sentence)
-                if token.lower() not in self._STOPWORDS
-            ]
-            if not tokens:
-                continue
-            if any(token in context_blob for token in tokens):
-                continue
-            preview = sentence[:80] + ("…" if len(sentence) > 80 else "")
-            issues.append(f"• \"{preview}\"")
-
-        if issues:
-            return (
-                "⚠️ Self-check: These statements were not confirmed in the retrieved passages:\n"
-                + "\n".join(issues)
-            )
-        return "✅ Self-check: Answer statements are supported by retrieved context."
-
     def _load_cross_encoder(self, model_name: Optional[str]):
         if not model_name:
             return None
@@ -416,7 +307,7 @@ class AgentOrchestrator:
             return None
 
     def _rerank(self, question: str, docs: List[Dict[str, object]]):
-        if not self.cross_encoder or not docs:
+        if not self.rerank_enabled or not self.cross_encoder or not docs:
             return docs
         try:
             pairs = [(question, (doc.get("content") or "")) for doc in docs]

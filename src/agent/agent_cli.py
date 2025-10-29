@@ -2,7 +2,18 @@ import logging
 
 from dotenv import load_dotenv
 
+
 from .orchestrator import AgentOrchestrator
+
+COMMAND_HELP = """
+Commands available:
+  • ingest / refresh data      → Re-run ingestion and embeddings
+  • embed / refresh vectors    → Rebuild embeddings from processed docs
+  • status                     → Show last ingestion/embed timestamps and counts
+  • show sources <query>       → Retrieve passages without answering
+  • help                       → Display this message
+  • exit / quit                → Leave the session
+""".strip()
 
 
 def _print_sources(sources) -> None:
@@ -27,7 +38,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     agent = AgentOrchestrator()
-    print("🤖 Agent orchestrator ready. Ask a question or type 'help' / 'exit'.")
+    print("🤖 Agent orchestrator ready. Type 'help' to see available commands.")
 
     while True:
         try:
@@ -44,19 +55,23 @@ def main() -> None:
             print("Goodbye!")
             break
         if lowered in {"help", "commands"}:
-            print(
-                "Commands:\n"
-                "  - Mention 'ingest' or 'refresh data' to rebuild the knowledge base.\n"
-                "  - Mention 'embed' or 'refresh vectors' to regenerate embeddings only.\n"
-                "  - Mention 'show sources' or 'retrieve' for context without an answer.\n"
-                "  - Any other question triggers retrieval + answer generation.\n"
-            )
+            print(COMMAND_HELP)
             continue
 
         response = agent.handle(user_input)
-        print(f"Assistant: {response.get('message', 'No message generated.')}\n")
-        _print_verification(response.get("verification"))
-        _print_sources(response.get("context") or [])
+        message = response.get("message", "No message generated.")
+        print(f"Assistant: {message}\n")
+
+        verification = response.get("verification")
+        _print_verification(verification)
+        sources = response.get("context") or []
+        _print_sources(sources)
+
+        if not sources or (verification and verification.startswith("⚠️")):
+            print(
+                "Tip: try `show sources <query>` or re-run `ingest` if the dataset changed."
+            )
+
         print()
 
 
