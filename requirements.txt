@@ -15,3 +15,7 @@ python-dotenv
 typesense
 langchain_openai
 langgraph
+pdfplumber
+pytesseract
+pillow
+beautifulsoup4
